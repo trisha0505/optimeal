@@ -2,8 +2,11 @@
 .env
 
 # Python
-__pycache__/
+backend/__pycache__/
 *.pyc
+
+# Database
+backend/instance/database.db
 
 # Node
 frontend/node_modules/

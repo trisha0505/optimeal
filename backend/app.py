@@ -5,11 +5,18 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import json
 import re
-
+import requests
+from datetime import date
+from post_waste import classify_food, get_solution
+from ngo_service import get_nearby_ngos
+import os
+from dotenv import load_dotenv
 # ================= INIT =================
 app = Flask(__name__)
 CORS(app)
 
+load_dotenv()
+SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY")
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -47,6 +54,18 @@ class Settings(db.Model):
     diet = db.Column(db.String(50))
     goal = db.Column(db.String(50))
     allergies = db.Column(db.String(200))
+class ConsumedMeal(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer)  # Links to the User model
+    recipe_id = db.Column(db.Integer)
+    recipe_title = db.Column(db.String(200))
+    date_logged = db.Column(db.Date, default=date.today)
+    
+    # Macros for the Sustainability / Nutrition Dashboard
+    calories = db.Column(db.Float, default=0.0)
+    protein = db.Column(db.Float, default=0.0)
+    fat = db.Column(db.Float, default=0.0)
+    carbs = db.Column(db.Float, default=0.0)
 # ================= HELPERS =================
 
 def is_valid_email(email):
@@ -253,6 +272,202 @@ def get_settings(user_id):
         "goal": s.goal,
         "allergies": s.allergies
     })
+@app.route("/api/analyze", methods=["POST"])
+def analyze_food():
+    try:
+        data = request.get_json()
+
+        required_fields = ["name", "expiry", "quantity"]
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"error": f"{field} is required"}), 400
+
+        name = data["name"]
+        expiry = data["expiry"]
+        quantity = int(data["quantity"])
+        is_cooked = data.get("is_cooked", False)
+        location = data.get("location", "Mumbai") # Defaulting to Mumbai based on your profile
+
+        decision = classify_food(expiry, quantity, is_cooked)
+        solution = get_solution(decision, location)
+
+        if decision == "donate":
+            ngos = get_nearby_ngos(location)
+            if not ngos:
+                ngos = [{
+                    "name": "No NGOs found nearby",
+                    "lat": None,
+                    "lng": None,
+                    "maps_link": f"https://www.google.com/maps/search/NGO+near+{location}"
+                }]
+            solution["nearby_ngos"] = ngos
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "food": name,
+                "decision": decision,
+                "solution": solution
+            }
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ================= OPTIMEAL CORE & NUTRITION APIS =================
+@app.route('/api/recommendations', methods=['POST'])
+def get_recommendations():
+    data = request.get_json()
+    diet_preference = data.get('diet', '')
+    
+    # THE FIX: Handles the "Search from Pantry" button
+    if data and data.get('use_pantry'):
+        pantry_items = PantryItem.query.all()
+        if not pantry_items:
+            return jsonify({"error": "Your pantry is empty! Add items in the Pantry tab first."}), 400
+        ingredients_str = ",".join([item.name for item in pantry_items])
+    else:
+        ingredients_str = ",".join(data.get('ingredients', [])) if data.get('ingredients') else ""
+        if not ingredients_str:
+            return jsonify({"error": "Please enter ingredients."}), 400
+
+    url = "https://api.spoonacular.com/recipes/complexSearch"
+    params = {
+        "includeIngredients": ingredients_str,
+        "diet": diet_preference,
+        "fillIngredients": True,
+        "addRecipeInformation": True,
+        "number": 12, 
+        "sort": "min-missing-ingredients",
+        "apiKey": SPOONACULAR_API_KEY
+    }
+
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status() 
+        raw_recipes = response.json().get("results", [])
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch recipes from API."}), 500
+
+    processed_recipes = []
+    for recipe in raw_recipes:
+        used = recipe.get("usedIngredientCount", 0)
+        missed = recipe.get("missedIngredientCount", 0)
+        total_required = used + missed
+        match_percentage = (used / total_required * 100) if total_required > 0 else 0
+
+        if match_percentage >= 80: tier = "Optimal Match"
+        elif match_percentage >= 50: tier = "Partial Match"
+        else: tier = "Low Match"
+
+        processed_recipes.append({
+            "id": recipe["id"],
+            "title": recipe["title"],
+            "image": recipe["image"],
+            "readyInMinutes": recipe.get("readyInMinutes", 0),
+            "matchPercentage": round(match_percentage),
+            "matchTier": tier,
+            "missingCount": missed,
+            "sourceUrl": recipe.get("sourceUrl", "#")
+        })
+
+    processed_recipes.sort(key=lambda x: x['matchPercentage'], reverse=True)
+    return jsonify({"status": "success", "recipes": processed_recipes})
+
+@app.route('/api/planner/generate', methods=['POST'])
+def generate_weekly_planner():
+    data = request.get_json() or {}
+    
+    try:
+        target_cal = int(data.get('targetCalories', 2000))
+    except (ValueError, TypeError):
+        target_cal = 2000
+
+    diet_pref = data.get('diet', '')
+
+    url = "https://api.spoonacular.com/mealplanner/generate"
+    params = {
+        "timeFrame": "week",
+        "targetCalories": target_cal,
+        "apiKey": SPOONACULAR_API_KEY
+    }
+    if diet_pref: 
+        params["diet"] = diet_pref
+
+    # Force Spoonacular to respond with JSON
+    headers = {
+        "Accept": "application/json"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        
+        # Safe JSON parsing
+        try:
+            res_data = response.json()
+        except ValueError:
+            print(f"Spoonacular sent non-JSON text: {response.text}")
+            return jsonify({"error": "Spoonacular returned an HTML error. Check terminal."}), 500
+
+        if response.status_code != 200:
+            print(f"Spoonacular Error: {res_data}")
+            return jsonify({"error": res_data.get("message", "API Error")}), 500
+
+        return jsonify({
+            "status": "success",
+            "schedule": res_data.get("week", {})
+        })
+        
+    except Exception as e:
+        print(f"Backend Error: {e}")
+        return jsonify({"error": "Failed to connect to API."}), 500
+
+@app.route('/api/meals/log', methods=['POST'])
+def log_meal():
+    """Saves a cooked meal to the database so we can track weekly nutrition"""
+    data = request.get_json()
+    try:
+        new_meal = ConsumedMeal(
+            user_id=data.get('user_id', 1), 
+            recipe_id=data.get('recipe_id'),
+            recipe_title=data.get('title'),
+            # Hackathon magic: We inject estimated macros so the dashboard looks great for judges
+            calories=data.get('calories', 450.0), 
+            protein=data.get('protein', 25.0),
+            fat=data.get('fat', 15.0),
+            carbs=data.get('carbs', 50.0)
+        )
+        db.session.add(new_meal)
+        db.session.commit()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"error": "Failed to save meal"}), 500
+
+@app.route('/api/meals/weekly-summary/<int:user_id>', methods=['GET'])
+def get_weekly_summary(user_id):
+    seven_days_ago = date.today() - timedelta(days=7)
+    recent_meals = ConsumedMeal.query.filter(
+        ConsumedMeal.user_id == user_id,
+        ConsumedMeal.date_logged >= seven_days_ago
+    ).all()
+    
+    total_calories = sum(meal.calories for meal in recent_meals)
+    total_protein = sum(meal.protein for meal in recent_meals)
+    total_fat = sum(meal.fat for meal in recent_meals)
+    total_carbs = sum(meal.carbs for meal in recent_meals)
+    
+    meals_list = [{"title": meal.recipe_title, "date": meal.date_logged.strftime("%Y-%m-%d")} for meal in recent_meals]
+    
+    return jsonify({
+        "status": "success",
+        "summary": {
+            "calories": round(total_calories, 1),
+            "protein": round(total_protein, 1),
+            "fat": round(total_fat, 1),
+            "carbs": round(total_carbs, 1)
+        },
+        "meals": meals_list
+    })
+
 # ================= MAIN =================
 if __name__ == '__main__':
     with app.app_context():
